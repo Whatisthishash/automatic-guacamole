@@ -124,13 +124,23 @@ jobs:
       # 6. PINNED VULNERABILITY SCAN
       - name: Run Trivy Scan
         if: steps.vars.outputs.error != 'true'
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ steps.vars.outputs.image }}
           format: 'json'
           output: 'trivy-report.json'
           exit-code: '0'
           scanners: 'vuln,secret'
+
+      # 7. GENERATE SBOM
+      - name: Run Trivy (Generate SBOM)
+        if: steps.vars.outputs.error != 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}
+          format: 'spdx-json'
+          output: 'sbom.json'
+          exit-code: '0'
 
       # 7. IMMEDIATE CREDENTIAL SCRUBBING
       - name: Cleanup Registry Credentials
