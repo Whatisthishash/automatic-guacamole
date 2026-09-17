@@ -135,12 +135,9 @@ jobs:
       # 7. GENERATE SBOM
       - name: Run Trivy (Generate SBOM)
         if: steps.vars.outputs.error != 'true'
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ steps.vars.outputs.image }}
-          format: 'spdx-json'
-          output: 'sbom.json'
-          exit-code: '0'
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy image --format spdx-json --output sbom.json "${{ steps.vars.outputs.image }}"
 
       # 7. IMMEDIATE CREDENTIAL SCRUBBING
       - name: Cleanup Registry Credentials
@@ -228,9 +225,9 @@ jobs:
           EOF
           
           # Move artifacts into the ledger folder
-          mv trivy-report.json "$DIR/vulnerability-report.json" || true
-          mv sbom.json "$DIR/sbom.json" || true
-          mv policy-results.json "$DIR/policy-results.json" || true
+          mv trivy-report.json "$DIR/vulnerability-report.json"
+          mv sbom.json "$DIR/sbom.json"
+          mv policy-results.json "$DIR/policy-results.json"
           
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
