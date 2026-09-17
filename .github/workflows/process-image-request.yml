@@ -1,0 +1,242 @@
+name: Process Image Request
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  process-request:
+    if: contains(github.event.issue.labels.*.name, 'image-request')
+    runs-on: ubuntu-latest
+    
+    permissions:
+      issues: write
+      contents: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. EXTRACT (Reads from file, safe from injection)
+      - name: Extract Requested Image
+        id: raw_input
+        run: |
+          BODY=$(jq -r '.issue.body' "$GITHUB_EVENT_PATH" | sed 's/\r//g')
+          IMAGE=$(echo "$BODY" | awk '/### Image URL \(including tag\)/{flag=1; next} /^###/{flag=0} flag && NF {print $0; exit}')
+          echo "requested=$IMAGE" >> $GITHUB_OUTPUT
+
+      # 2. STATUS INITIALIZATION (Input routed via env)
+      - name: Initialize Status Comment
+        id: status
+        uses: actions/github-script@v7
+        env:
+          REQ_IMAGE: ${{ steps.raw_input.outputs.requested }}
+        with:
+          result-encoding: string
+          script: |
+            const response = await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 **Automated Pipeline Started**\n\n- ⏳ 🛡️ Verifying Registry: \`${process.env.REQ_IMAGE}\`...\n- ⏳ ⬇️ Downloading and scanning image...\n- ⏳ ⚖️ Evaluating against policies...`
+            });
+            return response.data.id;
+
+      # 3. SECURE HOST EXTRACTION
+      - name: Extract Registry Host
+        id: registry
+        if: steps.raw_input.outputs.requested != ''
+        env:
+          REQ_IMAGE: ${{ steps.raw_input.outputs.requested }}
+        run: |
+          HOST=$(echo "$REQ_IMAGE" | cut -d/ -f1)
+          echo "host=$HOST" >> $GITHUB_OUTPUT
+
+      # 4. PINNED DYNAMIC LOGIN
+      - name: Login to GHCR
+        if: steps.registry.outputs.host == 'ghcr.io'
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Quay
+        if: steps.registry.outputs.host == 'quay.io'
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      # 5. SECURE VALIDATION SCRIPT
+      - name: Validate Image and Age
+        id: vars
+        env:
+          REQ_IMAGE: ${{ steps.raw_input.outputs.requested }}
+        run: |
+          IMAGE="$REQ_IMAGE"
+          
+          TRUSTED_PREFIXES=("docker.io/library/" "ghcr.io/your-org/" "quay.io/")
+          IS_TRUSTED=false
+          for PREFIX in "${TRUSTED_PREFIXES[@]}"; do
+            if [[ "$IMAGE" == "$PREFIX"* ]]; then
+              IS_TRUSTED=true
+              break
+            fi
+          done
+          
+          if [ "$IS_TRUSTED" = false ]; then
+            echo "error=true" >> $GITHUB_OUTPUT
+            echo "error_msg=Untrusted Registry! Images must come from an approved prefix." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          if [[ "$IMAGE" == *":latest" ]] || [[ "$IMAGE" != *":"* ]]; then
+            echo "error=true" >> $GITHUB_OUTPUT
+            echo "error_msg=The \`:latest\` tag (or untagged images) are not permitted." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          curl -sL https://github.com/google/go-containerregistry/releases/download/v0.19.1/go-containerregistry_Linux_x86_64.tar.gz | tar -xz crane
+          sudo mv crane /usr/local/bin/
+          
+          CREATED_DATE=$(crane config "$IMAGE" | jq -r '.created' || true)
+          if [ -z "$CREATED_DATE" ] || [ "$CREATED_DATE" == "null" ]; then
+            echo "error=true" >> $GITHUB_OUTPUT
+            echo "error_msg=Could not resolve image metadata." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          CREATED_EPOCH=$(date -d "$CREATED_DATE" +%s)
+          CURRENT_EPOCH=$(date +%s)
+          AGE_DAYS=$(( (CURRENT_EPOCH - CREATED_EPOCH) / 86400 ))
+          
+          if [ "$AGE_DAYS" -gt 180 ]; then
+            echo "error=true" >> $GITHUB_OUTPUT
+            echo "error_msg=Abandoned Tag Detected! Image is $AGE_DAYS days old." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          SAFE_NAME=$(echo "$IMAGE" | tr '/:' '-')
+          echo "filename=$SAFE_NAME" >> $GITHUB_OUTPUT
+
+      # 6. PINNED VULNERABILITY SCAN
+      - name: Run Trivy Scan
+        if: steps.vars.outputs.error != 'true'
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}
+          format: 'json'
+          output: 'trivy-report.json'
+          exit-code: '0'
+          scanners: 'vuln,secret'
+
+      # 7. IMMEDIATE CREDENTIAL SCRUBBING
+      - name: Cleanup Registry Credentials
+        if: always()
+        run: rm -f ~/.docker/config.json
+
+      # 8. OPA POLICY EVALUATION
+      - name: Install Conftest
+        if: steps.vars.outputs.error != 'true'
+        run: |
+          wget https://github.com/open-policy-agent/conftest/releases/download/v0.45.0/conftest_0.45.0_Linux_x86_64.tar.gz
+          tar xzf conftest_0.45.0_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin
+
+      - name: Evaluate Trivy Report with OPA
+        id: opa
+        if: steps.vars.outputs.error != 'true'
+        run: |
+          conftest test trivy-report.json --policy policy/ --output json > policy-results.json || true
+          FAILURES=$(jq '.[] | select(.failures != null) | .failures | length' policy-results.json)
+          
+          if [ "$FAILURES" != "" ] && [ "$FAILURES" -gt 0 ]; then
+            echo "status=failed" >> $GITHUB_OUTPUT
+            MSGS=$(jq -r '.[] | select(.failures != null) | .failures[].msg' policy-results.json)
+            EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+            echo "messages<<$EOF" >> $GITHUB_OUTPUT
+            echo "$MSGS" >> $GITHUB_OUTPUT
+            echo "$EOF" >> $GITHUB_OUTPUT
+          else
+            echo "status=passed" >> $GITHUB_OUTPUT
+          fi
+
+      # 9. SECURE FAILURE HANDLING
+      - name: Handle Failure
+        if: steps.vars.outputs.error == 'true' || steps.opa.outputs.status == 'failed'
+        uses: actions/github-script@v7
+        env:
+          ERROR_MSG: ${{ steps.vars.outputs.error_msg }}
+          FAIL_MSGS: ${{ steps.opa.outputs.messages }}
+          IMAGE_NAME: ${{ steps.vars.outputs.image }}
+          COMMENT_ID: ${{ steps.status.outputs.result }}
+        with:
+          script: |
+            let bodyText = '';
+            if (process.env.ERROR_MSG) {
+              bodyText = `❌ **Pipeline Failed**\n\n${process.env.ERROR_MSG}`;
+            } else {
+              const formattedMsgs = process.env.FAIL_MSGS.split('\n').filter(line => line.trim() !== '').map(line => `- ${line}`).join('\n');
+              bodyText = `❌ **Security Scan Failed**\n\nThe image \`${process.env.IMAGE_NAME}\` violates our security policies.\n\n**Reasons:**\n${formattedMsgs}`;
+            }
+            
+            await github.rest.issues.updateComment({
+              comment_id: process.env.COMMENT_ID, owner: context.repo.owner, repo: context.repo.repo,
+              body: bodyText
+            });
+            
+            await github.rest.issues.update({
+              issue_number: context.issue.number, owner: context.repo.owner, repo: context.repo.repo,
+              state: 'closed', state_reason: 'not_planned'
+            });
+            
+            core.setFailed('Security check failed.');
+
+      # 10. SECURE SUCCESS HANDLING
+      - name: Handle Success
+        if: steps.opa.outputs.status == 'passed'
+        env:
+          IMAGE_NAME: ${{ steps.vars.outputs.image }}
+          FILE_NAME: ${{ steps.vars.outputs.filename }}
+          COMMENT_ID: ${{ steps.status.outputs.result }}
+        run: |
+          DIR="approved-images/$FILE_NAME"
+          mkdir -p "$DIR"
+          
+          BODY=$(jq -r '.issue.body' "$GITHUB_EVENT_PATH" | sed 's/\r//g')
+          JUST=$(echo "$BODY" | awk '/### Business Justification/{flag=1; next} /^###/{flag=0} flag {print}')
+          INDENTED_JUST=$(echo "$JUST" | sed 's/^/  /')
+          
+          cat <<EOF > "$DIR/ledger.yaml"
+          requested_image: "$IMAGE_NAME"
+          requested_by: "${{ github.actor }}"
+          date_approved: "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          justification: |
+          $INDENTED_JUST
+          EOF
+          
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$DIR/"
+          git commit -m "Automated approval for $IMAGE_NAME"
+          git push
+
+      - name: Close Issue on Success
+        if: steps.opa.outputs.status == 'passed'
+        uses: actions/github-script@v7
+        env:
+          IMAGE_NAME: ${{ steps.vars.outputs.image }}
+          COMMENT_ID: ${{ steps.status.outputs.result }}
+        with:
+          script: |
+            await github.rest.issues.updateComment({
+              comment_id: process.env.COMMENT_ID,
+              owner: context.repo.owner, repo: context.repo.repo,
+              body: `✅ **Security Scan Passed**\n\nThe image \`${process.env.IMAGE_NAME}\` has been approved and committed to the ledger.`
+            });
+            await github.rest.issues.update({
+              issue_number: context.issue.number, owner: context.repo.owner, repo: context.repo.repo,
+              state: 'closed', state_reason: 'completed'
+            });
