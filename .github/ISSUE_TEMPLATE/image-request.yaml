@@ -1,0 +1,18 @@
+name: Request Image Approval
+description: Request a new container image to be scanned and added to the allow-list
+title: "[IMAGE REQUEST]: "
+labels: ["image-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please provide the details for the image you want to use. This request will be automatically evaluated by our policy engine.
+
+  - type: input
+    id: image_url
+    attributes:
+      label: Image URL (including tag)
+      description: "Example: ghcr.io/your-org/tool:v1.2 or ubuntu:22.04"
+      placeholder: "registry.example.com/image:tag"
+    validations:
+      required: true
