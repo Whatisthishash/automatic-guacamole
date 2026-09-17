@@ -97,8 +97,11 @@ jobs:
             exit 0
           fi
           
-          curl -sL https://github.com/google/go-containerregistry/releases/download/v0.19.1/go-containerregistry_Linux_x86_64.tar.gz | tar -xz crane
+          # Robust Crane Installation
+          wget -q --tries=3 "https://github.com/google/go-containerregistry/releases/download/v0.22.0/go-containerregistry_Linux_x86_64.tar.gz" -O crane.tar.gz
+          tar -xzf crane.tar.gz crane
           sudo mv crane /usr/local/bin/
+          rm crane.tar.gz
           
           CREATED_DATE=$(crane config "$IMAGE" | jq -r '.created' || true)
           if [ -z "$CREATED_DATE" ] || [ "$CREATED_DATE" == "null" ]; then
