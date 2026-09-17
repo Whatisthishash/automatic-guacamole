@@ -1,0 +1,7 @@
+[
+	{
+		"filename": "trivy-report.json",
+		"namespace": "main",
+		"successes": 1
+	}
+]
