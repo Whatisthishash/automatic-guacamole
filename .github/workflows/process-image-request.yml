@@ -227,10 +227,15 @@ jobs:
           $INDENTED_JUST
           EOF
           
+          # Move artifacts into the ledger folder
+          mv trivy-report.json "$DIR/vulnerability-report.json" || true
+          mv sbom.json "$DIR/sbom.json" || true
+          mv policy-results.json "$DIR/policy-results.json" || true
+          
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add "$DIR/"
-          git commit -m "Automated approval for $IMAGE_NAME"
+          git commit -m "Automated approval and SBOM for $IMAGE_NAME"
           git push
 
       - name: Close Issue on Success
